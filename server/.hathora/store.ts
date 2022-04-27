@@ -1,0 +1,206 @@
+import { randomBytes } from "crypto";
+import { existsSync, mkdirSync } from "fs";
+import { Chance } from "chance";
+import { Writer, Reader } from "bin-serde";
+import { Message, NO_DIFF } from "../../api/base";
+import { UserId, encodeStateSnapshot, encodeStateUpdate, PlayerState as UserState } from "../../api/types";
+import { register } from "./protocol";
+import { LogStore } from "@hathora/log-store";
+import { ImplWrapper } from "./wrapper";
+import { computeDiff } from "./diff";
+import { Context } from "./methods";
+
+type StateId = bigint;
+type UserInfo = { userState: UserState; changedAt: number; messages: Message[] };
+type StateInfo = { impl: ImplWrapper; chance: Chance.Chance; subscriptions: Map<UserId, UserInfo> };
+
+const stateInfo: Map<StateId, StateInfo> = new Map();
+const changedStates: Map<StateId, number> = new Map();
+const pendingMessages: Map<StateId, Set<UserId>> = new Map();
+
+const dataDir = process.env.DATA_DIR!;
+if (!existsSync(dataDir)) {
+  mkdirSync(dataDir);
+}
+const log = new LogStore(dataDir);
+
+class Store {
+  constructor() {
+    setInterval(() => {
+      changedStates.forEach((changedAt, stateId) => sendUpdates(stateId, changedAt));
+      changedStates.clear();
+      pendingMessages.forEach((userIds, stateId) => userIds.forEach((userId) => sendMessages(stateId, userId)));
+      pendingMessages.clear();
+    }, 50);
+  }
+  async newState(stateId: StateId, userId: UserId, data: Buffer) {
+    const seed = randomBytes(8).readBigUInt64LE();
+    const time = Date.now();
+    const chance = Chance(seed.toString());
+    const impl = new ImplWrapper(ctx(chance, time, stateId), data);
+    stateInfo.set(stateId, { impl, chance, subscriptions: new Map() });
+    log.append(
+      stateId,
+      time,
+      new Writer().writeUInt64(seed).writeString(userId).writeUVarint(data.length).writeBuffer(data).toBuffer()
+    );
+  }
+  async subscribeUser(stateId: StateId, userId: UserId) {
+    if (!stateInfo.has(stateId)) {
+      const loaded = await loadState(stateId);
+      if (loaded === undefined) {
+        coordinator.stateNotFound(stateId, userId);
+        return;
+      }
+      stateInfo.set(stateId, { impl: loaded.impl, chance: loaded.chance, subscriptions: new Map() });
+    }
+    sendSnapshot(stateId, userId);
+  }
+  unsubscribeUser(stateId: StateId, userId: UserId) {
+    if (!stateInfo.has(stateId)) {
+      return;
+    }
+    const subscribers = stateInfo.get(stateId)!.subscriptions;
+    if (subscribers.size > 1) {
+      subscribers.delete(userId);
+    } else {
+      stateInfo.delete(stateId);
+      changedStates.delete(stateId);
+      pendingMessages.delete(stateId);
+      log.unload(stateId);
+    }
+  }
+  async handleUpdate(stateId: StateId, userId: UserId, data: Buffer) {
+    if (!stateInfo.has(stateId)) {
+      return;
+    }
+    const { impl, chance, subscriptions } = stateInfo.get(stateId)!;
+    const reader = new Reader(data);
+    const [method, msgId, argsBuffer] = [
+      reader.readUInt8(),
+      reader.readUInt32(),
+      reader.readBuffer(reader.remaining()),
+    ];
+    const time = Date.now();
+    const response = await impl.getResult(userId, method, ctx(chance, time, stateId), argsBuffer);
+    if (subscriptions.has(userId)) {
+      subscriptions.get(userId)!.messages.push(Message.response(msgId, response));
+      const changedAt = impl.changedAt();
+      if (changedAt !== undefined) {
+        changedStates.set(stateId, changedAt);
+        pendingMessages.delete(stateId);
+        log.append(
+          stateId,
+          time,
+          new Writer()
+            .writeUInt8(method)
+            .writeString(userId)
+            .writeUVarint(argsBuffer.length)
+            .writeBuffer(argsBuffer)
+            .toBuffer()
+        );
+      } else {
+        addPendingMessage(stateId, userId);
+      }
+    }
+  }
+}
+
+const coordinator = await register(new Store());
+
+export async function loadState(stateId: StateId) {
+  try {
+    const rows = log.load(stateId);
+
+    const { time, record } = rows[0];
+    const reader = new Reader(record);
+    const seed = reader.readUInt64();
+    const userId = reader.readString();
+    const argsBuffer = reader.readBuffer(reader.readUVarint());
+    const chance = Chance(seed.toString());
+    const impl = new ImplWrapper(ctxNoEvents(chance, time), argsBuffer);
+
+    for (let i = 1; i < rows.length; i++) {
+      const { time, record } = rows[i];
+      const reader = new Reader(record);
+      const method = reader.readUInt8();
+      const userId = reader.readString();
+      const argsBuffer = reader.readBuffer(reader.readUVarint());
+      await impl.getResult(userId, method, ctxNoEvents(chance, time), argsBuffer);
+    }
+
+    return { impl, chance };
+  } catch (e) {
+    console.error("Unable to load state", stateId.toString(36));
+  }
+}
+
+async function sendSnapshot(stateId: StateId, userId: UserId) {
+  const { impl, subscriptions } = stateInfo.get(stateId)!;
+  const userState = await impl.getUserState(userId);
+  subscriptions.set(userId, { userState: JSON.parse(JSON.stringify(userState)), changedAt: 0, messages: [] });
+  const buf = encodeStateSnapshot(userState);
+  coordinator.stateUpdate(stateId, userId, Buffer.from(buf));
+}
+
+async function sendUpdates(stateId: StateId, changedAt: number) {
+  if (stateInfo.has(stateId)) {
+    const { impl, subscriptions } = stateInfo.get(stateId)!;
+    for (const [userId, userInfo] of subscriptions) {
+      const { userState: prevUserState, changedAt: prevChangedAt, messages } = userInfo!;
+      const currUserState = await impl.getUserState(userId);
+      const diff = computeDiff(currUserState, prevUserState);
+      if (diff !== NO_DIFF || messages.length > 0) {
+        const buf = encodeStateUpdate(diff !== NO_DIFF ? diff : undefined, changedAt - prevChangedAt, messages);
+        coordinator.stateUpdate(stateId, userId, Buffer.from(buf));
+        subscriptions.set(userId, { userState: JSON.parse(JSON.stringify(currUserState)), changedAt, messages: [] });
+      }
+    }
+  }
+}
+
+function sendMessages(stateId: StateId, userId: UserId) {
+  const messages = stateInfo.get(stateId)?.subscriptions.get(userId)?.messages;
+  if (messages !== undefined) {
+    const buf = encodeStateUpdate(undefined, 0, messages);
+    coordinator.stateUpdate(stateId, userId, Buffer.from(buf));
+    messages.splice(0);
+  }
+}
+
+function ctx(chance: Chance.Chance, time: number, stateId: StateId): Context {
+  return {
+    chance,
+    time,
+    sendEvent(event: string, userId: UserId) {
+      const userInfo = stateInfo.get(stateId)?.subscriptions.get(userId);
+      if (userInfo !== undefined) {
+        userInfo.messages.push(Message.event(event));
+        if (!changedStates.has(stateId)) {
+          addPendingMessage(stateId, userId);
+        }
+      }
+    },
+    broadcastEvent(event: string) {
+      if (stateInfo.has(stateId)) {
+        for (const [userId, { messages }] of stateInfo.get(stateId)!.subscriptions) {
+          messages.push(Message.event(event));
+          if (!changedStates.has(stateId)) {
+            addPendingMessage(stateId, userId);
+          }
+        }
+      }
+    },
+  };
+}
+
+function ctxNoEvents(chance: Chance.Chance, time: number): Context {
+  return { chance, time, sendEvent() {}, broadcastEvent() {} };
+}
+
+function addPendingMessage(stateId: StateId, userId: UserId) {
+  if (!pendingMessages.has(stateId)) {
+    pendingMessages.set(stateId, new Set());
+  }
+  pendingMessages.get(stateId)!.add(userId);
+}
